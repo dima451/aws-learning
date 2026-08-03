@@ -1,0 +1,99 @@
+schemaVersion: '2.2'
+description: Deploy Learning.Amazon container from ECR
+
+parameters:
+  ImageTag:
+    type: String
+    description: Full Git commit SHA
+    allowedPattern: '^[0-9a-f]{40}$'
+
+mainSteps:
+  - action: aws:runShellScript
+    name: deployContainer
+    inputs:
+      timeoutSeconds: '600'
+      runCommand:
+        - |
+          set -euo pipefail
+
+          AWS_REGION="eu-north-1"
+          AWS_ACCOUNT_ID="421153134580"
+          ECR_REPOSITORY="learn/basics"
+
+          CONTAINER_NAME="learning-amazon"
+          CONTAINER_PORT="8080"
+          HOST_PORT="80"
+
+          STATE_DIRECTORY="/opt/learning-amazon"
+          CURRENT_IMAGE_FILE="$STATE_DIRECTORY/current-image"
+
+          IMAGE_TAG="{{ ImageTag }}"
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          mkdir -p "$STATE_DIRECTORY"
+
+          PREVIOUS_IMAGE=""
+
+          if [[ -f "$CURRENT_IMAGE_FILE" ]]; then
+            PREVIOUS_IMAGE=$(cat "$CURRENT_IMAGE_FILE")
+          fi
+
+          echo "Deploying $IMAGE"
+
+          aws ecr get-login-password \
+            --region "$AWS_REGION" |
+            docker login \
+              --username AWS \
+              --password-stdin "$ECR_REGISTRY"
+
+          docker pull "$IMAGE"
+
+          docker stop "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+
+          docker run \
+            --detach \
+            --name "$CONTAINER_NAME" \
+            --publish "${HOST_PORT}:${CONTAINER_PORT}" \
+            --restart unless-stopped \
+            "$IMAGE"
+
+          echo "Waiting for health check"
+
+          HEALTHY=false
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent \
+              "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; then
+              HEALTHY=true
+              break
+            fi
+
+            sleep 3
+          done
+
+          if [[ "$HEALTHY" == "true" ]]; then
+            echo "$IMAGE" > "$CURRENT_IMAGE_FILE"
+            echo "Deployment succeeded"
+            exit 0
+          fi
+
+          echo "Deployment failed"
+          docker logs "$CONTAINER_NAME" --tail 200 || true
+          docker rm --force "$CONTAINER_NAME" || true
+
+          if [[ -n "$PREVIOUS_IMAGE" ]]; then
+            echo "Rolling back to $PREVIOUS_IMAGE"
+
+            docker pull "$PREVIOUS_IMAGE"
+
+            docker run \
+              --detach \
+              --name "$CONTAINER_NAME" \
+              --publish "${HOST_PORT}:${CONTAINER_PORT}" \
+              --restart unless-stopped \
+              "$PREVIOUS_IMAGE"
+          fi
+
+          exit 1
