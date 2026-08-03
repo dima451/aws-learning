@@ -5,7 +5,12 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  id-token: write
+
 env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: learn/basics
 
 jobs:
@@ -13,82 +18,112 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      image_tag: ${{ steps.set-tag.outputs.tag }}
+      image_tag: ${{ steps.image.outputs.tag }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set image tag
-        id: set-tag
-        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+        id: image
+        shell: bash
+        run: |
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          role-session-name: github-learning-amazon-build
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      - name: Build and push image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ steps.set-tag.outputs.tag }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        shell: bash
         run: |
+          set -euo pipefail
+
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
           docker build \
-            -f Learning.Amazon/Dockerfile \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            --file Learning.Amazon/Dockerfile \
+            --tag "$IMAGE" \
             Learning.Amazon
 
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$IMAGE"
 
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
 
+    environment: production
+
     steps:
-      - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v1
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          ECR_REPOSITORY: learn/basics
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: AWS_REGION,IMAGE_TAG,ECR_REPOSITORY
-          script: |
-            set -euo pipefail
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: github-learning-amazon-deploy
+          aws-region: ${{ env.AWS_REGION }}
 
-            AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-              --query "Account" \
-              --output text)
+      - name: Deploy through Systems Manager
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-            IMAGE="${ECR_URL}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "DeployLearningAmazon" \
+            --parameters "ImageTag=$IMAGE_TAG" \
+            --comment "Deploy Git commit $IMAGE_TAG" \
+            --query "Command.CommandId" \
+            --output text)
 
-            aws ecr get-login-password --region "$AWS_REGION" |
-              docker login \
-                --username AWS \
-                --password-stdin "$ECR_URL"
+          echo "SSM command: $COMMAND_ID"
 
-            docker pull "$IMAGE"
+          STATUS="Pending"
 
-            docker stop learning-amazon || true
-            docker rm learning-amazon || true
+          for attempt in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
 
-            docker run \
-              -d \
-              --name learning-amazon \
-              -p 80:3000 \
-              --restart always \
-              "$IMAGE"
+            echo "Deployment status: $STATUS"
 
-            docker image prune -f
+            case "$STATUS" in
+              Success)
+                break
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                break
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query '{
+              Status: Status,
+              Output: StandardOutputContent,
+              Error: StandardErrorContent
+            }' \
+            --output json
+
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "Deployment failed with status: $STATUS"
+            exit 1
+          fi
