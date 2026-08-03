@@ -30,6 +30,11 @@ jobs:
         run: |
           echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
+      - name: Show OIDC claims
+        uses: github/actions-oidc-debugger@main
+        with:
+          audience: sts.amazonaws.com
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
